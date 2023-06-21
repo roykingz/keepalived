@@ -41,6 +41,11 @@
 #define ICMP_BUFSIZE 128
 #define SOCK_RECV_BUFF 128*1024
 
+// 内核参数net.ipv4.ping_group_range指定了哪些用户组可以创建ICMP Echo sockets
+// 默认为1 0表示不允许任何用户组创建（即只有内核本身可以创建）
+// 若假设进程组id为10000，则可以将其ping_group_range设置为10000 10000，表示只允许
+// 这一个进程组创建ICMP Echo sockets
+// keepalived需要修改此range确保keepalived可以创建ICMP Echo sockets
 static const char * const ping_group_range = "/proc/sys/net/ipv4/ping_group_range";
 
 static gid_t save_gid_min;
@@ -50,9 +55,12 @@ static uint16_t seq_no;
 
 static void icmp_connect_thread(thread_ref_t);
 
+// 设置内核参数net.ipv4.ping_group_range，确保keepalived可以创建ICMP Echo sockets
+// 因为keepalived总是以root用户运行，用户组为0，因此实际上只需将range_begin改为0即可
 bool
 set_ping_group_range(bool set)
 {
+	// buf存放ping_group_range值，格式：range_begin\trange_end\t\n，因此最大23字节
 	char buf[10 + 1 + 10 + 1 + 1];	/* 2000000000<TAB>4294967295<NL> */
 	int fd;
 	ssize_t len, ret;
@@ -62,6 +70,7 @@ set_ping_group_range(bool set)
 	if (set == checked_ping_group_range)
 		return true;
 
+	// 打开/proc/sys/net/ipv4/ping_group_range
 	fd = open(ping_group_range, O_RDWR);
 	if (fd == -1)
 		return false;
@@ -74,16 +83,20 @@ set_ping_group_range(bool set)
 
 	buf[len] = '\0';
 
+	// range begin
 	val[0] = strtoul(buf, &endptr, 10);
 #if ULONG_MAX >= 1UL << 32
+	// 检查range begin小于32位无符号整数的最大值
 	if (val[0] >= 1UL << 32 || (*endptr != '\t' && *endptr != ' ')) {
 		close(fd);
 		return false;
 	}
 #endif
 
+	// range end
 	val[1] = strtol(endptr + 1, &endptr, 10);
 #if ULONG_MAX >= 1UL << 32
+	// 检查range end小于32位无符号整数的最大值
 	if (val[1] >= 1UL << 32 || *endptr != '\n') {
 		close(fd);
 		return false;
@@ -92,19 +105,27 @@ set_ping_group_range(bool set)
 
 	checked_ping_group_range = set;
 
+	// 如果是要打开权限且range begin已经是0，则直接返回true，因为keepalive是以root权限运行，用户组为0
+    // 如果是要恢复OS原初始值且range begin已经是之前keepalived暂存的OS初始值，则直接返回true
 	if ((set && val[0] == 0) ||
 	    (!set && val[0] == save_gid_min)) {
 		close(fd);
 		return true;
 	}
 
+	// 如果是要打开权限且range begin大于1，说明ping_group_range是其他用户设置过的，不是OS默认值1 0
+    // 此时需要发出一条告警，表示keepalived即将要修改ping_group_range中的range begin
 	if (set && val[0] > 1 && val[1] > 1)
 		log_message(LOG_INFO, "Warning: %s being expanded from %lu %lu to 0 %lu",
 				ping_group_range, val[0], val[1], val[1]);
 
+	// 如果是打开权限，range_begin设置为0，如果是关闭权限，则range_begin恢复初始值,range_end保持不变
+    // 不用关心range_end，因为keepalived是以root权限运行，即使0 0也可以确保root用户能创建ICMP Echo sockets
 	len = sprintf(buf, "%u\t%lu\t\n", set ? 0 : save_gid_min, val[1]);
 
+	// 文件游标移到文件开始处，前面read时已经后移了
 	lseek(fd, 0, SEEK_SET);
+	// 写入内核参数ping_group_range
 	ret = write(fd, buf, len);
 	if (ret == -1)
 		log_message(LOG_INFO, "Write %s failed - errno %d", ping_group_range, errno);
@@ -112,6 +133,7 @@ set_ping_group_range(bool set)
 		log_message(LOG_INFO, "Write %s wrote %zd bytes instead of %zd", ping_group_range, ret, len);
 	close(fd);
 
+	// 保存原range_begin，keepalived退出时需要恢复ping_group_range原始值
 	if (set)
 		save_gid_min = val[0];
 
@@ -149,6 +171,7 @@ ping_check_handler(__attribute__((unused)) const vector_t *strvec)
 	/* queue new checker */
 	queue_checker(&ping_checker_funcs, icmp_connect_thread, ping_check, CHECKER_NEW_CO(), true);
 
+	// 设置内核参数net.ipv4.ping_group_range，确保keepalived可以创建ICMP Echo sockets
 	if (!checked_ping_group_range)
 		set_ping_group_range(true);
 }
