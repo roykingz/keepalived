@@ -454,6 +454,7 @@ udp_icmp_check_state(int fd, enum connect_result status, thread_ref_t thread,
 
 	checker = THREAD_ARG(thread);
 
+	// 若udp载荷或icmp request发送成功，注册check线程，等待rs reply并检查是否匹配
 	if (status == connect_success) {
 		thread_add_read(thread->master, func, checker, fd, timeout, THREAD_DESTROY_CLOSE_FD);
 		return false;

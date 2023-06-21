@@ -198,20 +198,29 @@ static enum connect_result
 ping_it(int fd, conn_opts_t* co)
 {
 	struct icmphdr *icmp_hdr;
+	// send_buf即完整的icmp报文，包含icmp头和载荷
 	char send_buf[sizeof(*icmp_hdr) + ICMP_BUFSIZE] __attribute__((aligned(__alignof__(struct icmphdr))));
 
+	// 填充icmp载荷，这里我们填充的载荷是字符串"keepalived check - "的循环，最长为128字节
+	// 注意，icmp request报文是可以携带载荷的，而且对应的reply中必须携带相同载荷
 	set_buf(send_buf + sizeof(*icmp_hdr), ICMP_BUFSIZE);
 
+	// 将send_buf强制转换为struct icmphdr指针
 	icmp_hdr = PTR_CAST(struct icmphdr, send_buf);
 
+	// 设置icmp头，type为echo request
 	memset(icmp_hdr, 0, sizeof(*icmp_hdr));
 	icmp_hdr->type = ICMP_ECHO;
+	// 序号为全局变量seq_no，初始为0，注意赋值完之后会将seq_no加1
 	icmp_hdr->un.echo.sequence = seq_no++;
 
+	// 向rs发送request
 	if (sendto(fd, send_buf, sizeof(send_buf), 0, PTR_CAST(struct sockaddr, &co->dst), sizeof(struct sockaddr)) < 0) {
 		log_message(LOG_INFO, "send ICMP packet fail");
+		// 如果发送失败返回connect_error
 		return connect_error;
 	}
+	// 发送成功返回connect_success，接下来就是等rs reply
 	return connect_success;
 }
 
@@ -220,29 +229,38 @@ recv_it(int fd)
 {
 	ssize_t len;
 	const struct icmphdr *icmp_hdr;
+	// recv_buf存放完整icmp reply报文，含icmp头和载荷
 	char recv_buf[sizeof(*icmp_hdr) + ICMP_BUFSIZE] __attribute__((aligned(__alignof__(struct icmphdr))));
 
+	// 从socket接收reply报文
 	len = recv(fd, recv_buf, sizeof(recv_buf), 0);
 
+	// 接收失败直接返回connect_error
 	if (len < 0) {
 		log_message(LOG_INFO, "recv ICMP packet error");
 		return connect_error;
 	}
 
+	// 检查报文长度至少要大于icmp头的长度
 	if ((size_t)len < sizeof(*icmp_hdr)) {
 		log_message(LOG_INFO, "Error, got short ICMP packet, %zd bytes", len);
 		return connect_error;
 	}
 
+	// recv_buf强制转换为struct icmphdr指针
 	icmp_hdr = PTR_CAST_CONST(struct icmphdr, recv_buf);
+	// 检查icmp报文type为echo reply
 	if (icmp_hdr->type != ICMP_ECHOREPLY) {
 		log_message(LOG_INFO, "Got ICMP packet with type 0x%x", icmp_hdr->type);
 		return connect_error;
 	}
 
+	// 也就是说虽然我们在request报文中设置了载荷，但是我们并不检查reply报文载荷是否匹配
+	// rcz_TODO，这是闲的慌？是否可以不在request报文中设置载荷？
 	return connect_success;
 }
 
+// 实现类似ping_it
 static enum connect_result
 ping6_it(int fd, conn_opts_t* co)
 {
@@ -265,6 +283,7 @@ ping6_it(int fd, conn_opts_t* co)
 	return connect_success;
 }
 
+// 实现类似recv_it
 static enum connect_result
 recv6_it(int fd)
 {
@@ -303,46 +322,70 @@ icmp_epilog(thread_ref_t thread, bool is_success)
 
 	checker = THREAD_ARG(thread);
 
+	// 默认下一次健康检查时间为delay_loop之后
 	delay = checker->delay_loop;
+	// 如果1)本次检查成功，或者
+	// 2)已经连续失败的次数达到了用户设置的retry次数且checker当前为up或第一次运行
 	if (is_success || ((checker->is_up || !checker->has_run) && checker->retry_it >= checker->retry)) {
+		// 连续失败次数置0
 		checker->retry_it = 0;
 
+		// 若本次检查成功且之前checker为down或第一次运行，此时需要更新rs为up
 		if (is_success && (!checker->is_up || !checker->has_run)) {
 			log_message(LOG_INFO, "ICMP connection to %s success."
 					, FMT_CHK(checker));
+			// 暂存rs和checker先前状态，
+			// 如果是keepalived启动时，则alpha模式下checker和rs初始状态必是down,非alpha
+			// 模式checker和rs必为up
+			// 如果checker不是第一次运行，则checker和rs先前必为down，否则进不到这个if块中
 			checker_was_up = checker->is_up;
 			rs_was_alive = checker->rs->alive;
+			// 更新checker状态为up，如果rs没有其他failed checker的话，还会更新rs alive为true并向ipvs
+			// 添加rs或恢复rs原始权重，取决于rs是否设置inhibit参数
 			update_svr_checker_state(UP, checker);
+			// 如果rs状态变化，根据配置参数决定是否邮件通知
 			if (checker->rs->smtp_alert && !checker_was_up &&
 			    (rs_was_alive != checker->rs->alive || !global_data->no_checker_emails))
 				smtp_alert(SMTP_MSG_RS, checker, NULL,
 					   "=> ICMP CHECK succeed on service <=");
+		// 如果本次检查失败，且之前checker检查成功或者这是checker第一次运行
 		} else if (!is_success &&
 			   (checker->is_up || !checker->has_run)) {
+			// checker第一次运行且retry参数非0打印的日志，此时已经连续失败了retry次
 			if (checker->retry && checker->has_run)
 				log_message(LOG_INFO
 				    , "ICMP CHECK on service %s of %s failed after %u retries."
 				    , FMT_CHK(checker), FMT_VS(checker->vs)
 				    , checker->retry);
+			// checker非第一次运行或retry参数为0打印的日志
 			else
 				log_message(LOG_INFO
 				    , "ICMP CHECK on service %s failed."
 				    , FMT_CHK(checker));
+			// 暂存rs和checker先前状态
 			checker_was_up = checker->is_up;
 			rs_was_alive = checker->rs->alive;
+			// 更新checker状态为down，如果rs先前没有其他failed checker的话，还会更新rs alive为false并从dpvs
+			// 删除rs或设置rs权重为0，取决于rs是否设置inhibit参数
 			update_svr_checker_state(DOWN, checker);
+			// 如果rs状态变化，根据配置参数决定是否邮件通知
 			if (checker->rs->smtp_alert && checker_was_up &&
 			    (rs_was_alive != checker->rs->alive || !global_data->no_checker_emails))
 				smtp_alert(SMTP_MSG_RS, checker, NULL,
 					   "=> ICMP CHECK failed on service <=");
 		}
+	// 本次检查失败时且checker先前为up时，retry_it计数加1
+	// 如果先前checker就是down，则没有必要增加retry_it计数
 	} else if (checker->is_up) {
+		// 此时下一次健康检查的时间为delay_before_retry后
 		delay = checker->delay_before_retry;
 		++checker->retry_it;
 	}
 
+	// 无论如何，checker->has_run置为true
 	checker->has_run = true;
 
+	// 注册下一次健康检查timer
 	thread_add_timer(thread->master, icmp_connect_thread, checker, delay);
 }
 
@@ -352,12 +395,16 @@ icmp_check_thread(thread_ref_t thread)
 	checker_t *checker = THREAD_ARG(thread);
 	int status;
 
+	// thread->type由keepalived scheduler设置，epoll超时则设置thread->type为THREAD_READ_TIMEOUT
+	// 如果等待reply超时，则status置为error，并根据配置决定是否打印log
 	if (thread->type == THREAD_READ_TIMEOUT) {
 		if (checker->is_up &&
 		    (global_data->checker_log_all_failures || checker->log_all_failures))
 			log_message(LOG_INFO, "ICMP connection to address %s timeout.", FMT_CHK(checker));
 		status = connect_error;
 	} else
+		// 如果没有超时，说明收到了rs reply，调用recv_it/recv6_it函数接收reply报文
+		// recv_it/recv6_it函数不检查reply载荷，只要icmp type为echo reply即可
 		status = checker->co->dst.ss_family == AF_INET ?
 				recv_it(thread->u.f.fd) : recv6_it(thread->u.f.fd);
 
@@ -368,6 +415,7 @@ icmp_check_thread(thread_ref_t thread)
 	 */
 	thread_close_fd(thread);
 
+	// 接收reply成功或失败，调用icmp_epilog更新checker和rs状态
 	if (status == connect_success)
 		icmp_epilog(thread, 1);
 	else if (status == connect_error) {
@@ -397,19 +445,26 @@ icmp_connect_thread(thread_ref_t thread)
 		return;
 	}
 
+	// 根据这段注释，当一个rs ip会配置在多个vs中时，我们应取消icmp_ratelimit限制
+	// 关于内核参数icmp_ratelimit，可参考https://www.man7.org/linux/man-pages/man7/icmp.7.html
 	 /*
 	  * If we config a real server in several virtual server, the icmp_ratelimit should be cancelled.
 	  * echo 0 > /proc/sys/net/ipv4/icmp_ratelimit
 	  */
+	// icmp socket type为SOCK_DGRAM，同时设置了非阻塞和close_on_exec标志
+	// socket协议是ICMP或ICMPv6，取决于rs IP类型
 	if ((fd = socket(co->dst.ss_family, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
 			 co->dst.ss_family == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6)) == -1) {
 		log_message(LOG_INFO, "ICMP%s connect fail to create socket. Rescheduling.",
 				co->dst.ss_family == AF_INET ? "" : "v6");
+		// 如果socket fd创建失败，则等待delay_loop秒后再次尝试发起健康检查
 		thread_add_timer(thread->master, icmp_connect_thread, checker,
 				checker->delay_loop);
 		return;
 	}
 
+	// 设置socket接收buffer大小，代码中写死为128KB
+	// rcz_TODO 这个大小对于echo reply应该是够用了？
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)))
 		log_message(LOG_INFO, "setsockopt SO_RCVBUF for socket %d failed (%d) - %m", fd, errno);
 
@@ -417,14 +472,19 @@ icmp_connect_thread(thread_ref_t thread)
 	 * OK if setsockopt fails
 	 * Prevent users from pinging broadcast or multicast addresses
 	 */
+	// 向RS发送echo request报文
 	if (co->dst.ss_family == AF_INET)
 		status = ping_it(fd, co);
 	else
 		status = ping6_it(fd, co);
 
+	// 检查icmp request发送状态
+	// 当status状态为connect_success时，udp_icmp_check_state会
+	// 添加调用icmp_check_thread函数的线程，并返回false，其他status则直接返回true
 	/* handle icmp send status & register check worker thread */
 	if (udp_icmp_check_state(fd, status, thread, icmp_check_thread,
 		co->connection_to)) {
+		// status为非connect_success时，关闭fd并调用icmp_epilog更新checker和rs状态
 		close(fd);
 		icmp_epilog(thread, false);
 	}
